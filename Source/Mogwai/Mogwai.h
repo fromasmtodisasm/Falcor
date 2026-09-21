@@ -1,5 +1,5 @@
 /***************************************************************************
- # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
  # modification, are permitted provided that the following conditions
@@ -27,8 +27,15 @@
  **************************************************************************/
 #pragma once
 #include "Falcor.h"
-#include "FalcorExperimental.h"
+#include "Core/SampleApp.h"
+#include "Scene/SceneBuilder.h"
+#include "RenderGraph/RenderGraph.h"
 #include "AppData.h"
+
+namespace Falcor
+{
+    class SettingsProperties;
+}
 
 using namespace Falcor;
 
@@ -38,46 +45,29 @@ namespace Mogwai
     class Extension
     {
     public:
-        class Bindings
-        {
-        public:
-            pybind11::module& getModule() { return mModule; }
-            pybind11::class_<Renderer>& getMogwaiClass() { return mMogwai; }
-            template<typename T>
-            void addGlobalObject(const std::string& name, const T& obj, const std::string& desc)
-            {
-                if (mGlobalObjects.find(name) != mGlobalObjects.end()) throw std::exception(("Object '" + name + "' already exists").c_str());
-                Scripting::getGlobalContext().setObject(name, obj);
-                mGlobalObjects[name] = desc;
-            }
-
-        private:
-            Bindings(pybind11::module& m, pybind11::class_<Renderer>& c) : mModule(m), mMogwai(c) {}
-            friend class Renderer;
-            std::unordered_map<std::string, std::string> mGlobalObjects;
-            pybind11::module& mModule;
-            pybind11::class_<Renderer>& mMogwai;
-        };
-
         using UniquePtr = std::unique_ptr<Extension>;
         virtual ~Extension() = default;
 
         using CreateFunc = UniquePtr(*)(Renderer* pRenderer);
 
         virtual const std::string& getName() const { return mName; }
-        virtual void beginFrame(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo) {};
-        virtual void endFrame(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo) {};
+        virtual void beginFrame(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo) {};
+        virtual void endFrame(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo) {};
         virtual bool hasWindow() const { return false; }
         virtual bool isWindowShown() const { return false; }
         virtual void toggleWindow() {}
         virtual void renderUI(Gui* pGui) {};
         virtual bool mouseEvent(const MouseEvent& e) { return false; }
         virtual bool keyboardEvent(const KeyboardEvent& e) { return false; }
-        virtual void scriptBindings(Bindings& bindings) {};
-        virtual std::string getScript() { return {}; }
+        virtual bool gamepadEvent(const GamepadEvent& e) { return false; }
+        virtual void registerScriptBindings(pybind11::module& m) {};
+        virtual std::string getScriptVar() const { return {}; }
+        virtual std::string getScript(const std::string& var) const { return {}; }
         virtual void addGraph(RenderGraph* pGraph) {};
+        virtual void setActiveGraph(RenderGraph* pGraph) {};
         virtual void removeGraph(RenderGraph* pGraph) {};
         virtual void activeGraphChanged(RenderGraph* pNewGraph, RenderGraph* pPrevGraph) {};
+        virtual void onOptionsChange(const Settings::Options& options){}
 
     protected:
         Extension(Renderer* pRenderer, const std::string& name) : mpRenderer(pRenderer), mName(name) {}
@@ -86,31 +76,42 @@ namespace Mogwai
         std::string mName;
     };
 
-    class Renderer : public IRenderer
+    class Renderer : public SampleApp
     {
     public:
         struct Options
         {
             std::string scriptFile;
+            bool deferredLoad = false;
+            std::string sceneFile;
             bool silentMode = false;
+            bool useSceneCache = false;
+            bool rebuildSceneCache = false;
         };
 
-        Renderer(const Options& options);
+        using KeyCallback = std::function<bool(bool pressed, uint32_t key)>;
+        using SceneUpdateCallback = std::function<void(const ref<Scene>& pScene, double currentTime)>;
+
+        Renderer(const SampleAppConfig& config, const Options& options);
+        ~Renderer();
 
         void onLoad(RenderContext* pRenderContext) override;
-        void onFrameRender(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo) override;
-        void onResizeSwapChain(uint32_t width, uint32_t height) override;
+        void onOptionsChange() override;
+        void onFrameRender(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo) override;
+        void onResize(uint32_t width, uint32_t height) override;
         bool onKeyEvent(const KeyboardEvent& e) override;
         bool onMouseEvent(const MouseEvent& e) override;
+        bool onGamepadEvent(const GamepadEvent& gamepadEvent) override;
+        bool onGamepadState(const GamepadState& gamepadState) override;
         void onGuiRender(Gui* pGui) override;
         void onHotReload(HotReloadFlags reloaded) override;
         void onShutdown() override;
-        void onDroppedFile(const std::string& filename) override;
+        void onDroppedFile(const std::filesystem::path& path) override;
         void loadScriptDialog();
-        void loadScriptDeferred(const std::string& filename);
-        void loadScript(const std::string& filename);
+        void loadScriptDeferred(const std::filesystem::path& path);
+        void loadScript(const std::filesystem::path& path);
         void saveConfigDialog();
-        void saveConfig(const std::string& filename) const;
+        void saveConfig(const std::filesystem::path& path) const;
         static std::string getVersionString();
 
         static void extend(Extension::CreateFunc func, const std::string& name);
@@ -122,6 +123,14 @@ namespace Mogwai
         AppData& getAppData() { return mAppData; }
 
         RenderGraph* getActiveGraph() const;
+
+        uint32_t getActiveGraphIndex() const { return mActiveGraph; }
+
+        KeyCallback getKeyCallback() const { return mKeyCallback; }
+        void setKeyCallback(KeyCallback keyCallback) { mKeyCallback = keyCallback; }
+
+        SceneUpdateCallback getSceneUpdateCallback() const { return mSceneUpdateCallback; }
+        void setSceneUpdateCallback(SceneUpdateCallback sceneUpdateCallback) { mSceneUpdateCallback = sceneUpdateCallback; }
 
 //    private: // MOGWAI
         friend class Extension;
@@ -139,32 +148,39 @@ namespace Mogwai
 
         struct GraphData
         {
-            RenderGraph::SharedPtr pGraph;
+            ref<RenderGraph> pGraph;
             std::string mainOutput;
             bool showAllOutputs = false;
             std::vector<std::string> originalOutputs;
             std::vector<DebugWindow> debugWindows;
             std::unordered_map<std::string, uint32_t> graphOutputRefs;
+            IScene::UpdateFlags sceneUpdates = IScene::UpdateFlags::None;
         };
 
-        Scene::SharedPtr mpScene;
+        ref<Scene> mpScene;
+        sigs::Connection                mUpdateFlagsConnection; ///< Connection to the UpdateFlags signal.
+        /// SceneUpdateFlags accumulated since last `beginFrame()`
+        IScene::UpdateFlags             mUpdateFlags = IScene::UpdateFlags::None;
 
-        void addGraph(const RenderGraph::SharedPtr& pGraph);
-        void removeGraph(const RenderGraph::SharedPtr& pGraph);
+
+        void addGraph(const ref<RenderGraph>& pGraph);
+        void setActiveGraph(const ref<RenderGraph>& pGraph);
+        void removeGraph(const ref<RenderGraph>& pGraph);
         void removeGraph(const std::string& graphName);
-        RenderGraph::SharedPtr getGraph(const std::string& graphName) const;
-        void initGraph(const RenderGraph::SharedPtr& pGraph, GraphData* pData);
+        ref<RenderGraph> getGraph(const std::string& graphName) const;
+        void initGraph(const ref<RenderGraph>& pGraph, GraphData* pData);
 
         void removeActiveGraph();
         void loadSceneDialog();
-        void loadScene(std::string filename, SceneBuilder::Flags buildFlags = SceneBuilder::Flags::Default);
-        void setScene(const Scene::SharedPtr& pScene);
-        Scene::SharedPtr getScene() const;
+        void loadScene(std::filesystem::path path, SceneBuilder::Flags buildFlags = SceneBuilder::Flags::Default);
+        void unloadScene();
+        void setScene(const ref<Scene>& pScene);
+        ref<Scene> getScene() const;
         void executeActiveGraph(RenderContext* pRenderContext);
-        void beginFrame(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo);
-        void endFrame(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo);
+        void beginFrame(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo);
+        void endFrame(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo);
 
-        std::vector<std::string> getGraphOutputs(const RenderGraph::SharedPtr& pGraph);
+        std::vector<std::string> getGraphOutputs(const ref<RenderGraph>& pGraph);
         void graphOutputsGui(Gui::Widgets& widget);
         bool renderDebugWindow(Gui::Widgets& widget, const Gui::DropdownList& dropdown, DebugWindow& data, const uint2& winSize); // Returns false if the window was closed
         void renderOutputUI(Gui::Widgets& widget, const Gui::DropdownList& dropdown, std::string& selectedOutput);
@@ -172,14 +188,20 @@ namespace Mogwai
         void eraseDebugWindow(size_t id);
         void unmarkOutput(const std::string& name);
         void markOutput(const std::string& name);
-        size_t findGraph(std::string_view name);
+        size_t findGraph(const std::string_view name);
+
+        void addOption(std::string_view name, nlohmann::json value);
+        void addOptions(const nlohmann::json& value);
+        void addFilteredAttributes(const nlohmann::json& attributes);
+        void clearOptions();
+        void clearFilteredAttributes();
 
         AppData mAppData;
 
         std::vector<GraphData> mGraphs;
         uint32_t mActiveGraph = 0;
-        Sampler::SharedPtr mpSampler = nullptr;
-        std::string mScriptFilename;
+        ref<Sampler> mpSampler = nullptr;
+        std::filesystem::path mScriptPath;
 
         // Editor stuff
         void openEditor();
@@ -188,14 +210,19 @@ namespace Mogwai
         void applyEditorChanges();
         void setActiveGraph(uint32_t active);
 
-        static const size_t kInvalidProcessId = -1; // We use this to know that the editor was launching the viewer
+        static constexpr size_t kInvalidProcessId = -1; // We use this to know that the editor was launching the viewer
         size_t mEditorProcess = 0;
-        std::string mEditorTempFile;
+        std::filesystem::path mEditorTempPath;
         std::string mEditorScript;
+
+        KeyCallback mKeyCallback;
+        SceneUpdateCallback mSceneUpdateCallback;
+        FILE*       mPipedOutput = nullptr;
 
         // Scripting
         void registerScriptBindings(pybind11::module& m);
-        std::string mGlobalHelpMessage;
+
+        void handleGamepadInput(float deltaTimeSeconds);
     };
 
 #define MOGWAI_EXTENSION(Name)                         \

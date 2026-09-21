@@ -1,5 +1,5 @@
 /***************************************************************************
- # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
  # modification, are permitted provided that the following conditions
@@ -25,7 +25,17 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
-#include "stdafx.h"
+#include "Falcor.h"
+#include "Mogwai.h"
+#include "RenderGraph/RenderGraphIR.h"
+#include "RenderGraph/RenderGraphImportExport.h"
+#include "Utils/Scripting/Scripting.h"
+#include "Utils/Scripting/ScriptWriter.h"
+#include "Utils/Settings/Settings.h"
+
+#include <fstream>
+#include <pybind11/pybind11.h>
+#include <pybind11_json/pybind11_json.hpp>
 
 namespace Mogwai
 {
@@ -33,49 +43,43 @@ namespace Mogwai
     {
         const std::string kRunScript = "script";
         const std::string kLoadScene = "loadScene";
+        const std::string kUnloadScene = "unloadScene";
         const std::string kSaveConfig = "saveConfig";
         const std::string kAddGraph = "addGraph";
+        const std::string kSetActiveGraph = "setActiveGraph";
         const std::string kRemoveGraph = "removeGraph";
         const std::string kGetGraph = "getGraph";
         const std::string kUI = "ui";
-        const std::string kResizeSwapChain = "resizeSwapChain";
+        const std::string kKeyCallback = "keyCallback";
+        const std::string kResizeFrameBuffer = "resizeFrameBuffer";
+        const std::string kRenderFrame = "renderFrame";
         const std::string kActiveGraph = "activeGraph";
         const std::string kScene = "scene";
+        const std::string kClock = "clock";
+        const std::string kProfiler = "profiler";
+        const std::string kSceneUpdateCallback = "sceneUpdateCallback";
 
         const std::string kRendererVar = "m";
-        const std::string kTimeVar = "t";
 
-        template<typename T>
-        std::string prepareHelpMessage(const T& g)
-        {
-            std::string s = Renderer::getVersionString() + "\nGlobal utility objects:\n";
-            static const size_t kMaxSpace = 8;
-            for (auto n : g)
-            {
-                s += "\t'" + n.first + "'";
-                s += (n.first.size() >= kMaxSpace) ? " " : std::string(kMaxSpace - n.first.size(), ' ');
-                s += n.second;
-                s += "\n";
-            }
+        const std::string kGlobalHelp =
+            Renderer::getVersionString() +
+            "\nGlobal variables:\n" +
+            "\tm                  Mogwai instance.\n"
+            "\nGlobal functions\n" +
+            "\trenderFrame()      Render a frame. If the clock is not paused, it will advance by one tick. You can use it inside for loops, for example to loop over a specific time-range.\n" +
+            "\texit()             Terminate.\n";
 
-            s += "\nGlobal functions\n";
-            s += "\trenderFrame()      Render a frame. If the clock is not paused, it will advance by one tick. You can use it inside for loops, for example to loop over a specific time-range\n";
-            s += "\texit()             Exit Mogwai\n";
-            return s;
-        }
-
-        std::string windowConfig()
+        std::string windowConfig(const SampleAppConfig& c)
         {
             std::string s;
-            SampleConfig c = gpFramework->getConfig();
             s += "# Window Configuration\n";
-            s += Scripting::makeMemberFunc(kRendererVar, kResizeSwapChain, c.windowDesc.width, c.windowDesc.height);
-            s += Scripting::makeSetProperty(kRendererVar, kUI, c.showUI);
+            s += ScriptWriter::makeMemberFunc(kRendererVar, kResizeFrameBuffer, c.windowDesc.width, c.windowDesc.height);
+            s += ScriptWriter::makeSetProperty(kRendererVar, kUI, c.showUI);
             return s;
         }
     }
 
-    void Renderer::saveConfig(const std::string& filename) const
+    void Renderer::saveConfig(const std::filesystem::path& path) const
     {
         std::string s;
 
@@ -93,59 +97,83 @@ namespace Mogwai
         if (mpScene)
         {
             s += "# Scene\n";
-            s += Scripting::makeMemberFunc(kRendererVar, kLoadScene, Scripting::getFilenameString(mpScene->getFilename()));
+            // In the past we did try to find a relative path to the asset search directories, for now we skip this.
+            s += ScriptWriter::makeMemberFunc(kRendererVar, kLoadScene, ScriptWriter::getPathString(mpScene->getPath()));
             const std::string sceneVar = kRendererVar + "." + kScene;
             s += mpScene->getScript(sceneVar);
             s += "\n";
         }
 
-        s += windowConfig() + "\n";
+        s += windowConfig(getConfig()) + "\n";
 
-        s += "# Time Settings\n";
-        s += gpFramework->getGlobalClock().getScript(kTimeVar) + "\n";
+        {
+            s += "# Clock Settings\n";
+            const std::string clockVar = kRendererVar + "." + kClock;
+            s += getGlobalClock().getScript(clockVar) + "\n";
+        }
 
         for (auto& pe : mpExtensions)
         {
-            auto eStr = pe->getScript();
-            if (eStr.size()) s += eStr + "\n";
+            if (auto var = pe->getScriptVar(); !var.empty())
+            {
+                var = kRendererVar + "." + var;
+                auto eStr = pe->getScript(var);
+                if (eStr.size()) s += eStr + "\n";
+            }
         }
 
-        std::ofstream(filename) << s;
+        std::ofstream(path) << s;
     }
 
     void Renderer::registerScriptBindings(pybind11::module& m)
     {
-        pybind11::class_<Renderer> renderer(m, "Renderer");
-        renderer.def(kRunScript.c_str(), &Renderer::loadScript, "filename"_a = std::string());
-        renderer.def(kLoadScene.c_str(), &Renderer::loadScene, "filename"_a = std::string(), "buildFlags"_a = SceneBuilder::Flags::Default);
-        renderer.def(kSaveConfig.c_str(), &Renderer::saveConfig, "filename"_a);
-        renderer.def(kAddGraph.c_str(), &Renderer::addGraph, "graph"_a);
-        renderer.def(kRemoveGraph.c_str(), pybind11::overload_cast<const std::string&>(&Renderer::removeGraph), "name"_a);
-        renderer.def(kRemoveGraph.c_str(), pybind11::overload_cast<const RenderGraph::SharedPtr&>(&Renderer::removeGraph), "graph"_a);
-        renderer.def(kGetGraph.c_str(), &Renderer::getGraph, "name"_a);
-        renderer.def("graph", &Renderer::getGraph); // PYTHONDEPRECATED
-        auto envMap = [](Renderer* pRenderer, const std::string& filename) { if (pRenderer->getScene()) pRenderer->getScene()->loadEnvMap(filename); };
-        renderer.def("envMap", envMap, "filename"_a); // PYTHONDEPRECATED
+        using namespace pybind11::literals;
 
-        // PYTHONDEPRECATED Use the global function defined in the script bindings in Sample.cpp when resizing from a Python script.
-        auto resize = [](Renderer* pRenderer, uint32_t width, uint32_t height) {gpFramework->resizeSwapChain(width, height); };
-        renderer.def(kResizeSwapChain.c_str(), resize);
+        pybind11::class_<Renderer> renderer(m, "Renderer");
+        renderer.def(kRunScript.c_str(), &Renderer::loadScript, "path"_a);
+        renderer.def(kLoadScene.c_str(), &Renderer::loadScene, "path"_a, "buildFlags"_a = SceneBuilder::Flags::Default);
+        renderer.def(kUnloadScene.c_str(), &Renderer::unloadScene);
+        renderer.def(kSaveConfig.c_str(), &Renderer::saveConfig, "path"_a);
+        renderer.def(kAddGraph.c_str(), &Renderer::addGraph, "graph"_a);
+        renderer.def(kSetActiveGraph.c_str(),
+            [](Renderer* pRenderer, const ref<RenderGraph>& pGraph)
+            {
+                pRenderer->setActiveGraph(pGraph);
+            }, "graph"_a);
+        renderer.def(kRemoveGraph.c_str(), pybind11::overload_cast<const std::string&>(&Renderer::removeGraph), "name"_a);
+        renderer.def(kRemoveGraph.c_str(), pybind11::overload_cast<const ref<RenderGraph>&>(&Renderer::removeGraph), "graph"_a);
+        renderer.def(kGetGraph.c_str(), &Renderer::getGraph, "name"_a);
+        renderer.def_property(kSceneUpdateCallback.c_str(), &Renderer::getSceneUpdateCallback, &Renderer::setSceneUpdateCallback);
+
+        auto resizeFrameBuffer = [](Renderer* pRenderer, uint32_t width, uint32_t height) { pRenderer->resizeFrameBuffer(width, height); };
+        renderer.def(kResizeFrameBuffer.c_str(), resizeFrameBuffer);
+        renderer.def("resizeSwapChain", resizeFrameBuffer); // PYTHONDEPRECATED
+
+        auto renderFrame = [](Renderer* pRenderer) { pRenderer->getProgressBar().close(); pRenderer->renderFrame(); };
+        renderer.def(kRenderFrame.c_str(), renderFrame);
 
         renderer.def_property_readonly(kScene.c_str(), &Renderer::getScene);
         renderer.def_property_readonly(kActiveGraph.c_str(), &Renderer::getActiveGraph);
+        renderer.def_property_readonly(kClock.c_str(), [] (Renderer* pRenderer) { return &pRenderer->getGlobalClock(); });
+        renderer.def_property_readonly(kProfiler.c_str(), [] (Renderer* pRenderer) { return pRenderer->getDevice()->getProfiler(); });
 
-        auto getUI = [](Renderer* pRenderer) { return gpFramework->isUiEnabled(); };
-        auto setUI = [](Renderer* pRenderer, bool show) { gpFramework->toggleUI(show); };
+        auto getUI = [](Renderer* pRenderer) { return pRenderer->isUiEnabled(); };
+        auto setUI = [](Renderer* pRenderer, bool show) { pRenderer->toggleUI(show); };
         renderer.def_property(kUI.c_str(), getUI, setUI);
 
-        Extension::Bindings b(m, renderer);
-        b.addGlobalObject(kRendererVar, this, "The engine");
-        b.addGlobalObject(kTimeVar, &gpFramework->getGlobalClock(), "Time Utilities");
-        for (auto& pe : mpExtensions) pe->scriptBindings(b);
-        mGlobalHelpMessage = prepareHelpMessage(b.mGlobalObjects);
+        renderer.def_property(kKeyCallback.c_str(), &Renderer::getKeyCallback, &Renderer::setKeyCallback);
+
+        for (auto& pe : mpExtensions)
+        {
+            pe->registerScriptBindings(m);
+            if (auto var = pe->getScriptVar(); !var.empty())
+            {
+                renderer.def_property_readonly(var.c_str(), [&pe] (Renderer* pRenderer) { return pe.get(); });
+            }
+        }
 
         // Replace the `help` function
-        auto globalHelp = [this]() { pybind11::print(mGlobalHelpMessage);};
+        auto globalHelp = []() { pybind11::print(kGlobalHelp); };
         m.def("help", globalHelp);
 
         auto objectHelp = [](pybind11::object o)
@@ -155,5 +183,48 @@ namespace Mogwai
             h(o);
         };
         m.def("help", objectHelp, "object"_a);
+
+        // Register global renderer variable.
+        Scripting::getDefaultContext().setObject(kRendererVar, this);
+
+        // Register deprecated global variables.
+        Scripting::getDefaultContext().setObject("t", &getGlobalClock()); // PYTHONDEPRECATED
+
+        auto findExtension = [this](const std::string& name)
+        {
+            for (auto& pe : mpExtensions)
+            {
+                if (pe->getName() == name) return pe.get();
+            }
+            FALCOR_ASSERT(false);
+            return static_cast<Extension*>(nullptr);
+        };
+
+        Scripting::getDefaultContext().setObject("fc", findExtension("Frame Capture")); // PYTHONDEPRECATED
+        Scripting::getDefaultContext().setObject("tc", findExtension("Timing Capture")); // PYTHONDEPRECATED
+
+        renderer.def("getSettings", pybind11::overload_cast<>(&Renderer::getSettings), pybind11::return_value_policy::reference);
+
+        renderer.def("addOptions", [](Renderer* r, pybind11::dict d = {})
+        {
+            r->addOptions(pyjson::to_json(d));
+        }, "dict"_a = pybind11::dict());
+        renderer.def("addFilteredAttributes", [](Renderer* r, pybind11::dict d = {})
+        {
+            r->addFilteredAttributes(pyjson::to_json(d));
+        }, "dict"_a = pybind11::dict());
+        renderer.def("addFilteredAttributes", [](Renderer* r, pybind11::list l = pybind11::list{0})
+        {
+            r->addFilteredAttributes(pyjson::to_json(l));
+        }, "list"_a = pybind11::list());
+        renderer.def("clearOptions", [](Renderer* r)
+        {
+            r->clearOptions();
+        });
+        renderer.def("clearFilteredAttributes", [](Renderer* r)
+        {
+            r->clearFilteredAttributes();
+        });
+
     }
 }

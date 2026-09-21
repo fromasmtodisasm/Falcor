@@ -1,0 +1,9 @@
+Source/Falcor/Rendering
+Source/Falcor/Scene
+Source/Mogwai
+Source/plugins/importers/USDImporter
+
+# Explicitly whitelisted files
+!Source/Falcor/Rendering/Materials
+!Source/Falcor/Scene/Material
+

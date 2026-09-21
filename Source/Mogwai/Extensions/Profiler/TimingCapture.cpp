@@ -1,5 +1,5 @@
 /***************************************************************************
- # Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2015-23, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
  # modification, are permitted provided that the following conditions
@@ -25,14 +25,14 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
-#include "stdafx.h"
+#include "Falcor.h"
 #include "TimingCapture.h"
 
 namespace Mogwai
 {
     namespace
     {
-        const std::string kScriptVar = "tc";
+        const std::string kScriptVar = "timingCapture";
         const std::string kCaptureFrameTime = "captureFrameTime";
     }
 
@@ -43,39 +43,42 @@ namespace Mogwai
         return UniquePtr(new TimingCapture(pRenderer));
     }
 
-    void TimingCapture::scriptBindings(Bindings& bindings)
+    void TimingCapture::registerScriptBindings(pybind11::module& m)
     {
-        auto& m = bindings.getModule();
+        using namespace pybind11::literals;
 
         pybind11::class_<TimingCapture> timingCapture(m, "TimingCapture");
 
-        bindings.addGlobalObject(kScriptVar, this, "Timing Capture Helpers");
-
         // Members
-        timingCapture.def(kCaptureFrameTime.c_str(), &TimingCapture::captureFrameTime, "filename"_a);
+        timingCapture.def(kCaptureFrameTime.c_str(), &TimingCapture::captureFrameTime, "path"_a);
     }
 
-    void TimingCapture::beginFrame(RenderContext* pRenderContext, const Fbo::SharedPtr& pTargetFbo)
+    std::string TimingCapture::getScriptVar() const
+    {
+        return kScriptVar;
+    }
+
+    void TimingCapture::beginFrame(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo)
     {
         recordPreviousFrameTime();
     }
 
-    void TimingCapture::captureFrameTime(std::string filename)
+    void TimingCapture::captureFrameTime(std::filesystem::path path)
     {
         if (mFrameTimeFile.is_open())
             mFrameTimeFile.close();
 
-        if (!filename.empty())
+        if (!path.empty())
         {
-            if (doesFileExist(filename))
+            if (std::filesystem::exists(path))
             {
-                logWarning("Frame times in file '" + filename + "' will be overwritten.");
+                logWarning("Frame times in file '{}' will be overwritten.", path);
             }
 
-            mFrameTimeFile.open(filename, std::ofstream::trunc);
+            mFrameTimeFile.open(path, std::ofstream::trunc);
             if (!mFrameTimeFile.is_open())
             {
-                logError("Failed to open file '" + filename + "' for writing. Ignoring call.");
+                logError("Failed to open file '{}' for writing. Ignoring call.", path);
             }
         }
     }
@@ -85,7 +88,7 @@ namespace Mogwai
         if (!mFrameTimeFile.is_open()) return;
 
         // The FrameRate object is updated at the start of each frame, the first valid time is available on the second frame.
-        auto& frameRate = gpFramework->getFrameRate();
+        auto& frameRate = mpRenderer->getFrameRate();
         if (frameRate.getFrameCount() > 1)
             mFrameTimeFile << frameRate.getLastFrameTime() << std::endl;
     }
